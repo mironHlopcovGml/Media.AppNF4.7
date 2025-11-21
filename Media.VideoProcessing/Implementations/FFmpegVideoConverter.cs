@@ -1,11 +1,13 @@
-﻿using Microsoft.Extensions.Options;
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+// Убедитесь, что пространство имен совпадает с вашим проектом
+using ModularMediaApp.Modules.VideoProcessing;
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using ModularMediaApp.Modules.VideoProcessing;
 
 namespace Media.VideoProcessing.Implementations
 {
@@ -13,18 +15,15 @@ namespace Media.VideoProcessing.Implementations
     {
         private readonly FFmpegOptions _opts;
         private readonly ILogger<FFmpegVideoConverter> _logger;
-        private readonly TimeSpan _timeout = TimeSpan.FromMinutes(30);
-        private static readonly SemaphoreSlim _processSemaphore = new SemaphoreSlim(4, 4); // Лимит 4 параллельных FFmpeg
-
-        public bool UseFragmentedMp4 { get; set; } = false;
+        private readonly SemaphoreSlim _processSemaphore;
 
         public FFmpegVideoConverter(IOptions<FFmpegOptions> options, ILogger<FFmpegVideoConverter> logger)
         {
             _opts = options.Value ?? throw new ArgumentNullException(nameof(options));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
-            if (string.IsNullOrEmpty(_opts.Path) || !File.Exists(_opts.Path))
-                throw new InvalidOperationException("Invalid FFmpeg path in configuration.");
+            int limit = _opts.MaxConcurrentFFmpegProcesses > 0 ? _opts.MaxConcurrentFFmpegProcesses : 4;
+            _processSemaphore = new SemaphoreSlim(limit, limit);
         }
 
         public Task<(Stream OutputStream, Task CompletionTask)> ConvertToMp4WithFlacAsync(string inputFile, CancellationToken ct = default)
@@ -33,123 +32,213 @@ namespace Media.VideoProcessing.Implementations
         }
 
         public async Task<(Stream OutputStream, Task CompletionTask)> ConvertToMp4WithFlacAsync(
-            string inputFile, string saveWaveformPath, CancellationToken ct = default)
+            string inputFile,
+            string saveWaveformPath,
+            CancellationToken ct = default)
         {
-            return await StartFFmpegProcess(inputFile, saveWaveformPath, ct);
-        }
+            if (!File.Exists(inputFile))
+                throw new FileNotFoundException("Input file not found", inputFile);
 
-        private async Task<(Stream OutputStream, Task CompletionTask)> StartFFmpegProcess(
-            string inputFile, string saveWaveformPath, CancellationToken ct)
-        {
+            // Ждем слот в семафоре
+            await _processSemaphore.WaitAsync(ct).ConfigureAwait(false);
 
-            var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(_timeout);
+            Process process = new Process();
+            // Важно: RunContinuationsAsynchronously заставляет await завершаться в пуле потоков, не блокируя UI/Context
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var errorOutput = new StringBuilder();
 
-            var tcs = new TaskCompletionSource<bool>();
+            // Флаг для гарантии, что Release вызовется только один раз
+            // (Exited может вызываться конкурентно с catch блоком в редких случаях)
+            int cleanupDone = 0;
 
-            string ffmpegArgs = saveWaveformPath != null
-      ? "-i \"" + inputFile + "\" " +
-        "-map 0:v -map 0:a " +
-        "-c:v copy -c:a flac " +
-        "-movflags frag_keyframe+empty_moov+separate_moof+default_base_moof " +
-        "-f mp4 pipe:1 " +
-        "-filter_complex \"[0:a]showwavespic=s=1200x300:colors=blue:scale=sqrt[wave]\" " +
-        "-map \"[wave]\" -frames:v 1 -update 1 -y \"" + saveWaveformPath + "\""
-      : "-i \"" + inputFile + "\" " +
-        "-map 0:v -map 0:a " +
-        "-c:v copy -c:a flac " +
-        "-movflags frag_keyframe+empty_moov+separate_moof+default_base_moof " +
-        "-f mp4 pipe:1 ";
+            Stopwatch sw = new Stopwatch();
 
-
-            var psi = new ProcessStartInfo
+            void CleanupAndRelease()
             {
-                FileName = _opts.Path,
-                Arguments = ffmpegArgs,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
+                if (Interlocked.Exchange(ref cleanupDone, 1) == 0)
+                {
+                    try { _processSemaphore.Release(); } catch { }
+                    try { process.Dispose(); } catch { }
+                }
+            }
 
-            await _processSemaphore.WaitAsync(cts.Token);
-
-            Process process = null;
             try
             {
-                process = new Process { StartInfo = psi, EnableRaisingEvents = true };
-                var errorOutput = new System.Text.StringBuilder();
+                process.StartInfo.FileName = _opts.Path;
+                process.StartInfo.UseShellExecute = false;
+                process.StartInfo.CreateNoWindow = true;
+                process.StartInfo.RedirectStandardOutput = true;
+                process.StartInfo.RedirectStandardError = true;
 
-                process.ErrorDataReceived += (sender, e) =>
+                // Используем безопасное построение аргументов
+                process.StartInfo.Arguments = BuildArguments(inputFile, saveWaveformPath);
+
+                process.EnableRaisingEvents = true;
+
+                process.ErrorDataReceived += (s, e) =>
                 {
                     if (e.Data != null) errorOutput.AppendLine(e.Data);
                 };
 
-                process.Exited += (sender, e) =>
+                process.Exited += (s, e) =>
+                {
+                    sw.Stop();
+                    // Логика завершения
+                    bool success = (process.ExitCode == 0);
+
+                    if (!success)
+                    {
+                        string err = errorOutput.ToString();
+                        _logger.LogError("FFmpeg failed with code {Code}. " +
+                            "Duration={Duration}ms." +
+                            " Stderr: {Err}",
+                            process.ExitCode,
+                            sw.ElapsedMilliseconds,
+                            err);
+                        tcs.TrySetException(new InvalidOperationException("FFmpeg error: " + err));
+                    }
+                    else
+                    {
+                        _logger.LogInformation("FFmpeg completed successfully. " +
+                            "Duration={Duration}ms",
+                            sw.ElapsedMilliseconds);
+                        tcs.TrySetResult(true);
+                    }
+
+                    // Освобождаем ресурсы
+                    CleanupAndRelease();
+                };
+
+                bool started = process.Start();
+                if (!started)
+                    throw new InvalidOperationException("Could not start FFmpeg process (Start returned false)");
+
+                sw.Start();
+
+                _logger.LogInformation("FFmpeg started. PID: {Id}", process.Id);
+
+                process.BeginErrorReadLine();
+
+                // Регистрация отмены (CancellationToken)
+                var ctr = ct.Register(() =>
                 {
                     try
                     {
-                        string errors = errorOutput.ToString();
-
-                        // Ошибку логируем только если код != 0
-                        if (process.ExitCode != 0)
+                        if (!process.HasExited)
                         {
-                            if (!string.IsNullOrWhiteSpace(errors))
-                                _logger.LogError("FFmpeg stderr: {Errors}", errors);
-
-                            tcs.TrySetException(
-                                new InvalidOperationException(
-                                    $"FFmpeg failed (code {process.ExitCode}). See stderr above."));
-                        }
-                        else
-                        {
-                            // успешный случай — не выводим stderr!
-                            tcs.TrySetResult(true);
+                            process.Kill(); // В .NET 4.6 убивает только главный процесс
                         }
                     }
                     catch (Exception ex)
                     {
-                        tcs.TrySetException(ex);
+                        _logger.LogWarning(ex, "Error killing FFmpeg process");
                     }
-                    finally
-                    {
-                        _processSemaphore.Release();
-                        process.Dispose();
-                    }
-                };
-
-
-                cts.Token.Register(() =>
-                {
-                    try { if (!process.HasExited) process.Kill(); } catch { /* ignore */ }
                     tcs.TrySetCanceled();
                 });
 
-                if (!process.Start())
-                {
-                    _processSemaphore.Release();
-                    process.Dispose();
-                    throw new InvalidOperationException("Failed to start FFmpeg");
-                }
-
-                _logger.LogInformation("FFmpeg started, PID {Pid}, Input: {InputFile}", process.Id, inputFile);
-
-                process.BeginErrorReadLine();
+                // Отписываемся от токена, когда задача завершена, чтобы избежать утечек памяти
+                // (ContinueWith здесь безопасен, так как tcs создан с RunContinuationsAsynchronously)
+                tcs.Task.ContinueWith(_ => ctr.Dispose());
 
                 return (process.StandardOutput.BaseStream, tcs.Task);
             }
             catch (Exception)
             {
-                // Если Start() не удался, событие Exited не сработает,
-                // поэтому семафор нужно освободить здесь.
-                if (process != null && !process.HasExited)
-                {
-                    _processSemaphore.Release();
-                }
-                process?.Dispose();
+                // Если упали ДО запуска (например, BuildArguments выкинул исключение или Start() упал)
+                CleanupAndRelease();
                 throw;
             }
         }
-    }
 
+        // --- БЕЗОПАСНАЯ РАБОТА С АРГУМЕНТАМИ ---
+
+        private string BuildArguments(string inputFile, string saveWaveformPath)
+        {
+            var sb = new StringBuilder();
+
+            // 1. Входной файл
+            sb.Append("-i ");
+            sb.Append(EscapeArgument(inputFile));
+            sb.Append(" ");
+
+            // 2. Маппинг и кодеки
+            sb.Append("-map 0:v -map 0:a -c:v copy -c:a flac ");
+
+            // 3. Флаги для стриминга (фрагментированный MP4)
+            sb.Append("-movflags frag_keyframe+empty_moov+separate_moof+default_base_moof ");
+
+            // 4. Вывод в Pipe
+            sb.Append("-f mp4 - ");
+
+            // 5. Опциональная генерация waveform
+            if (!string.IsNullOrEmpty(saveWaveformPath))
+            {
+                // filter_complex - это один аргумент, содержащий пробелы и спецсимволы.
+                // Его нужно экранировать целиком.
+                string filter = "[0:a]showwavespic=s=1200x300:colors=blue:scale=sqrt[wave]";
+
+                sb.Append("-filter_complex ");
+                sb.Append(EscapeArgument(filter)); // Экранируем сам фильтр
+
+                sb.Append(" -map \"[wave]\" -frames:v 1 -update 1 -y ");
+                sb.Append(EscapeArgument(saveWaveformPath));
+            }
+
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Правильное экранирование аргументов командной строки для Windows (cmd.exe rules).
+        /// Решает проблему путей, заканчивающихся на '\'.
+        /// </summary>
+        private static string EscapeArgument(string arg)
+        {
+            if (string.IsNullOrEmpty(arg)) return "\"\"";
+
+            // Если нет пробелов и кавычек, можно не оборачивать (но лучше перестраховаться, если есть спецсимволы)
+            // Для надежности оборачиваем почти все, что не выглядит простым числом или словом.
+            if (arg.IndexOfAny(new[] { ' ', '\t', '\n', '\v', '\"' }) == -1 && !arg.EndsWith("\\"))
+            {
+                return arg;
+            }
+
+            var sb = new StringBuilder();
+            sb.Append('"');
+
+            for (int i = 0; i < arg.Length; i++)
+            {
+                char c = arg[i];
+                int backslashes = 0;
+
+                // Считаем обратные слэши
+                while (i < arg.Length && arg[i] == '\\')
+                {
+                    backslashes++;
+                    i++;
+                }
+
+                if (i == arg.Length)
+                {
+                    // Конец строки: удваиваем слэши, чтобы они не экранировали закрывающую кавычку
+                    sb.Append('\\', backslashes * 2);
+                    break;
+                }
+                else if (arg[i] == '"')
+                {
+                    // Перед кавычкой: удваиваем слэши + 1 слэш для экранирования кавычки
+                    sb.Append('\\', backslashes * 2 + 1);
+                    sb.Append('"');
+                }
+                else
+                {
+                    // Обычный символ: просто пишем слэши (если были) и сам символ
+                    sb.Append('\\', backslashes);
+                    sb.Append(arg[i]);
+                }
+            }
+
+            sb.Append('"');
+            return sb.ToString();
+        }
+    }
 }

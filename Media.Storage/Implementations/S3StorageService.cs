@@ -19,15 +19,13 @@ namespace Media.Storage.Implementations
         private readonly StorageOptions _options;
         private readonly TransferUtility _transferUtility;
         private readonly ILogger<S3StorageService> _logger;
-        private readonly AsyncRetryPolicy _retryPolicy;
-
-        public S3StorageService(IAmazonS3 s3, IOptions<StorageOptions> options, ILogger<S3StorageService> logger, AsyncRetryPolicy retryPolicy)
+        
+        public S3StorageService(IAmazonS3 s3, IOptions<StorageOptions> options, ILogger<S3StorageService> logger)
         {
             _s3 = s3;
             _options = options.Value;
             _transferUtility = new TransferUtility(_s3);
             _logger = logger;
-            _retryPolicy = retryPolicy;
         }
 
         public Task UploadAsync(string path, Stream data, CancellationToken ct = default) => UploadStreamAsync(path, data, ct);
@@ -45,8 +43,13 @@ namespace Media.Storage.Implementations
 
             try
             {
-                await _retryPolicy.ExecuteAsync(() => _transferUtility.UploadAsync(uploadRequest, ct));
+                await _transferUtility.UploadAsync(uploadRequest, ct).ConfigureAwait(false);
                 _logger.LogInformation("Uploaded to S3: {Path} ({Elapsed}ms)", path, stopwatch.ElapsedMilliseconds);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                _logger.LogWarning("Upload of {Path} canceled", path);
+                throw;
             }
             catch (Exception ex)
             {
@@ -57,20 +60,20 @@ namespace Media.Storage.Implementations
 
         public async Task<Stream> DownloadAsync(string path, CancellationToken ct = default)
         {
-            var resp = await _retryPolicy.ExecuteAsync(() => _s3.GetObjectAsync(_options.BucketName, path, ct));
+            var resp = await _s3.GetObjectAsync(_options.BucketName, path, ct).ConfigureAwait(false);
             return resp.ResponseStream;
         }
 
         public async Task DeleteAsync(string path, CancellationToken ct = default)
         {
-            await _retryPolicy.ExecuteAsync(() => _s3.DeleteObjectAsync(_options.BucketName, path, ct));
+            await _s3.DeleteObjectAsync(_options.BucketName, path, ct).ConfigureAwait(false);
         }
 
         public async Task<bool> ExistsAsync(string path, CancellationToken ct = default)
         {
             try
             {
-                await _retryPolicy.ExecuteAsync(() => _s3.GetObjectMetadataAsync(_options.BucketName, path, ct));
+                await _s3.GetObjectMetadataAsync(_options.BucketName, path, ct).ConfigureAwait(false);
                 return true;
             }
             catch (AmazonS3Exception ex) when (ex.StatusCode == HttpStatusCode.NotFound)

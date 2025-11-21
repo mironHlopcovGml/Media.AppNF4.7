@@ -52,7 +52,7 @@ namespace Media.App
                 {
                     string inputFile = args.Length > 0 ?
                         args[0] :
-                        "C:\\Users\\administrator\\Desktop\\ffmpeg-2025-07-31-git-119d127d05-full_build\\bin\\Dikie-46948.mp4";
+                        "C:\\Users\\administrator\\Desktop\\ffmpeg-2025-07-31-git-119d127d05-full_build\\bin\\Test1.avi";
 
                     if (!File.Exists(inputFile))
                     {

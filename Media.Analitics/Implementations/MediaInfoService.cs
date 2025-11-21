@@ -1,10 +1,9 @@
-﻿using MediaInfo; // пространство имён из нового пакета
-﻿using MediaInfo; // пространство имён из нового пакета
+﻿using MediaInfo;
 using Microsoft.Extensions.Logging;
 using System;
 using System.IO;
-using System.Threading.Tasks;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Media.Analitics.Implementations
 {
@@ -17,53 +16,84 @@ namespace Media.Analitics.Implementations
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
-        public Task<MediaInfoResult> GetMediaInfoAsync(string filePath, CancellationToken ct = default)
+        public async Task<MediaInfoResult> GetMediaInfoAsync(string filePath, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
-                throw new ArgumentException("Файл не найден или путь некорректен.", nameof(filePath));
+            if (string.IsNullOrWhiteSpace(filePath))
+                throw new ArgumentException("Путь к файлу не может быть пустым", nameof(filePath));
 
-            return Task.Run(() =>
+            if (!File.Exists(filePath))
+                throw new FileNotFoundException("Файл не найден", filePath);
+
+            return await Task.Factory.StartNew(() =>
             {
                 ct.ThrowIfCancellationRequested();
-                using (var mi = new MediaInfo.MediaInfo())
+
+                var mi = new MediaInfo.MediaInfo();
+                try
                 {
-                    mi.Open(filePath);
+                    var openResult = mi.Open(filePath);
+
+                    if (openResult == IntPtr.Zero)
+                    {
+                        throw new InvalidOperationException(
+                            $"MediaInfo не смог открыть файл: {filePath}");
+                    }
+
                     ct.ThrowIfCancellationRequested();
 
-                    // Проверяем, удалось ли открыть файл
-                    if (string.IsNullOrEmpty(mi.Get(StreamKind.General, 0, "Format")))
+                    string format = mi.Get(StreamKind.General, 0, "Format");
+
+                    if (string.IsNullOrEmpty(format))
                     {
-                        _logger.LogWarning("MediaInfo не смог проанализировать файл {FilePath}", filePath);
-                        throw new InvalidOperationException("Не удалось получить информацию о медиафайле.");
+                        _logger.LogWarning("MediaInfo не распознал формат файла {FilePath}", filePath);
+                        throw new InvalidOperationException(
+                            $"MediaInfo: Неизвестный формат: {filePath}");
                     }
-                    
+
+                    int? TryInt(string v) => int.TryParse(v, out var x) ? x : (int?)null;
+                    long? TryLong(string v) => long.TryParse(v, out var x) ? x : (long?)null;
+
+                    string durationStr = mi.Get(StreamKind.General, 0, "Duration");
+                    TimeSpan? duration = null;
+
+                    if (long.TryParse(durationStr, out long durMs))
+                        duration = TimeSpan.FromMilliseconds(durMs);
+
                     var result = new MediaInfoResult
                     {
-                        ContainerFormat = mi.Get(StreamKind.General, 0, "Format"),
-                        Duration = mi.Get(StreamKind.General, 0, "Duration/String3"),
-                        
+                        ContainerFormat = format,
+                        Duration = duration?.ToString(@"hh\:mm\:ss\.fff"),
+
                         VideoCodec = mi.Get(StreamKind.Video, 0, "Format"),
-                        Width = int.TryParse(mi.Get(StreamKind.Video, 0, "Width"), out var w) ? w : (int?)null,
-                        Height = int.TryParse(mi.Get(StreamKind.Video, 0, "Height"), out var h) ? h : (int?)null,
+                        Width = TryInt(mi.Get(StreamKind.Video, 0, "Width")),
+                        Height = TryInt(mi.Get(StreamKind.Video, 0, "Height")),
                         VideoBitrate = mi.Get(StreamKind.Video, 0, "BitRate/String"),
                         FrameRate = mi.Get(StreamKind.Video, 0, "FrameRate/String"),
-                        
+
                         AudioCodec = mi.Get(StreamKind.Audio, 0, "Format"),
                         AudioChannels = mi.Get(StreamKind.Audio, 0, "Channel(s)/String"),
                         AudioSampleRate = mi.Get(StreamKind.Audio, 0, "SamplingRate/String"),
                         AudioBitrate = mi.Get(StreamKind.Audio, 0, "BitRate/String"),
-                        
-                        FileSize = long.TryParse(mi.Get(StreamKind.General, 0, "FileSize"), out var size) ? size : (long?)null,
+
+                        FileSize = TryLong(mi.Get(StreamKind.General, 0, "FileSize")),
                         FileName = Path.GetFileName(filePath),
                         FullPath = Path.GetFullPath(filePath)
                     };
 
-                    _logger.LogInformation("Медиаинформация успешно получена для {FilePath}: {Video} {Audio}",
-                        filePath, result.VideoCodec, result.AudioCodec);
+                    _logger.LogInformation(
+                        "MediaInfo успешно прочитан: {File} (V:{V}, A:{A})",
+                        result.FileName, result.VideoCodec, result.AudioCodec);
 
                     return result;
                 }
-            }, ct);
+                finally
+                {
+                    try { mi.Close(); } catch { }
+                    try { mi.Dispose(); } catch { }
+                }
+
+            }, ct, TaskCreationOptions.LongRunning, TaskScheduler.Default)
+            .ConfigureAwait(false);
         }
 
         public Task<MediaInfoResult> GetMediaInfoAsync(string filePath)
