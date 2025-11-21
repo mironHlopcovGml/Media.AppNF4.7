@@ -24,7 +24,7 @@ namespace Media.Analitics.Implementations
             if (!File.Exists(filePath))
                 throw new FileNotFoundException("Файл не найден", filePath);
 
-            return await Task.Factory.StartNew(() =>
+            return await Task.Run(() =>
             {
                 ct.ThrowIfCancellationRequested();
 
@@ -92,7 +92,7 @@ namespace Media.Analitics.Implementations
                     try { mi.Dispose(); } catch { }
                 }
 
-            }, ct, TaskCreationOptions.LongRunning, TaskScheduler.Default)
+            }, ct)
             .ConfigureAwait(false);
         }
 
