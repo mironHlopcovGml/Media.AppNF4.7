@@ -75,7 +75,11 @@ namespace Media.App
                         logger.LogWarning("Видео без аудио — FLAC пропускается");
                         throw new InvalidOperationException("Нет аудио");
                     }
-
+                    if (info.VideoCodec.Contains("pyv5"))
+                    {
+                        logger.LogError("Видео требует нативной библиотеки pyv5 и пропускается");
+                        return;
+                    }
                     Console.WriteLine("Конвертация видео в MP4 с FLAC...");
                     string waveformPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".png");
                     string targetVideoPath = "converted/output.mp4";
